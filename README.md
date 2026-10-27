@@ -28,7 +28,7 @@ The `claude` command must be on your `PATH` and logged in for `check`.
 
 `asks.jsonl` holds `{id, first_seen, last_seen, repeats, text}`; `repeats` is how many later times the same ask came
 up (near-duplicates are merged by token Jaccard, default threshold 0.6, `--threshold` to change). Only genuine human
-turns are kept: tool results, system reminders, hook text, sidechain turns and compaction summaries are skipped.
+turns are kept, including messages typed while the agent was busy (delivered inside other records or as queued prompts); tool results, system reminders, hook text, sidechain turns and compaction summaries are skipped.
 
 Each worker is `claude -p --model haiku --tools Read,Grep,Glob --allowedTools Read,Grep,Glob` with its working
 directory at the repo and the fixed prompt in `prompts/check.md`. It returns `{id, verdict, evidence, note}` with

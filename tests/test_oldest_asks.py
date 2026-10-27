@@ -11,7 +11,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 from oldest_asks import check as chk  # noqa: E402
 from oldest_asks.cli import main  # noqa: E402
-from oldest_asks.extract import extract  # noqa: E402
+from oldest_asks.extract import extract, split_asks  # noqa: E402
 
 
 def user(ts, content, **extra):
@@ -104,6 +104,48 @@ class OldestAsksTests(unittest.TestCase):
         self.assertEqual(len(cmds), 5)
         self.assertIn("--model haiku", cmds[0])
         self.assertIn("--tools Read,Grep,Glob", cmds[0])
+
+    def test_messages_sent_mid_turn_are_extracted(self):
+        note = ("The user sent a new message while you were working:\nSummarize the nightly report for Ann Example.\n\n"
+                "This is how Claude Code surfaces messages the user sends mid-turn.")
+        with tempfile.TemporaryDirectory() as tmp:
+            f = Path(tmp) / "s.jsonl"
+            write_transcript(f, [
+                # embedded in a tool-result record
+                user("2026-02-01T08:00:00Z", [
+                    {"type": "tool_result", "tool_use_id": "t1", "content": "Delete the cache directory"},
+                    {"type": "text", "text": note}], toolUseResult={"stdout": "x"}),
+                # queued prompt attachments: human is kept, task notifications and peers are not
+                {"type": "attachment", "timestamp": "2026-02-02T08:00:00Z", "attachment": {
+                    "type": "queued_command", "commandMode": "prompt", "origin": {"kind": "human"},
+                    "prompt": "Write a changelog entry for ann@example.invalid"}},
+                {"type": "attachment", "timestamp": "2026-02-03T08:00:00Z", "attachment": {
+                    "type": "queued_command", "commandMode": "task-notification",
+                    "origin": {"kind": "task-notification"}, "prompt": "Restart the worker pool"}},
+                {"type": "attachment", "timestamp": "2026-02-04T08:00:00Z", "attachment": {
+                    "type": "queued_command", "commandMode": "prompt", "origin": {"kind": "peer"},
+                    "prompt": "Reboot the machine"}},
+            ])
+            texts = " | ".join(a["text"] for a in extract([f]))
+        self.assertIn("Summarize the nightly report for Ann Example", texts)
+        self.assertIn("Write a changelog entry", texts)
+        for banned in ("Delete the cache", "Restart the worker pool", "Reboot the machine", "This is how Claude Code"):
+            self.assertNotIn(banned, texts)
+
+    def test_lowercase_imperatives_are_asks(self):
+        for sentence in ("get one in for the demo", "add auto context to the planner", "come back to these daily",
+                         "integrate: https://example.invalid/tool"):
+            self.assertEqual(len(split_asks(sentence)), 1, sentence)
+        # a lowercase imperative after a full stop is its own ask, and a trailing colon keeps its target
+        self.assertEqual(split_asks("the build is red. fix the build. integrate:\nhttps://example.invalid/tool"),
+                         ["fix the build.", "integrate: https://example.invalid/tool"])
+        self.assertEqual(split_asks("do you know the answer"), [])
+
+    def test_short_asks_are_kept(self):
+        self.assertEqual(split_asks("push"), ["push"])
+        self.assertEqual(split_asks("Stop. Retry now."), ["Stop.", "Retry now."])
+        self.assertEqual(split_asks("ok"), [])
+        self.assertEqual(split_asks("thanks a lot"), [])
 
 
 if __name__ == "__main__":

@@ -3,6 +3,7 @@
 import hashlib
 import json
 import re
+from datetime import datetime
 from pathlib import Path
 
 # Text that looks like a user turn but is injected by the harness.
@@ -30,14 +31,22 @@ _VERBS = set(
     support handle parse convert generate wire hook connect log track save store load fetch download upload
     reduce increase improve optimize speed split join combine dedupe sort filter validate prevent avoid
     stop fail return expose export import integrate port migrate rewrite revert undo
+    come take bring put go do wait hold ping remind report schedule monitor watch continue proceed
+    resume retry rerun re-run rebuild redo drop skip ignore pause note remember double-check recheck
+    progress vet notify shorten work understand integrate push pull audit trace compare diff grep cat tail head
+    never always don't dont
     please need want should must""".split()
 )
+_PRONOUNS = {"you", "we", "they", "it", "i", "he", "she"}
 _ASK_RE = re.compile(
     r"\b(please|can you|could you|would you|will you|i want|i need|i would like|i'd like|we need|"
-    r"we should|you should|make sure|don't forget|do not forget|todo)\b",
+    r"we should|you should|make sure|don't forget|do not forget|todo|needs? to|have to|must|should|"
+    r"how (?:do|can|could|would|should)|how i)\b",
     re.I,
 )
-_SPLIT_RE = re.compile(r"(?<=[.!?])\s+(?=[A-Z0-9\"'(\[])|\n+")
+_SPLIT_RE = re.compile(
+    r"(?<=[.!?])\s+(?=[A-Z0-9\"'(\[]|(?:%s)\b)|\n+" % "|".join(sorted(_VERBS - {"please", "need", "want", "should", "must"}, key=len, reverse=True))
+)
 _BULLET_RE = re.compile(r"^\s*(?:\d+[.)]|[-*•])\s+")
 _TOKEN_RE = re.compile(r"[a-z0-9_]+")
 
@@ -62,52 +71,114 @@ def clean_text(text):
     return text.strip()
 
 
-def human_text(entry):
-    """Return the text of a genuine human user turn, or None."""
-    if entry.get("type") != "user":
-        return None
-    if entry.get("isMeta") or entry.get("isSidechain") or entry.get("isCompactSummary"):
-        return None
-    if entry.get("isVisibleInTranscriptOnly") or entry.get("toolUseResult") is not None:
-        return None
-    msg = entry.get("message")
-    if not isinstance(msg, dict) or msg.get("role") != "user":
-        return None
-    content = msg.get("content")
+_EMBEDDED_RE = re.compile(
+    r"The user sent a new message while you were working:[ \t]*\n(.*?)(?:\n[ \t]*\nThis is how Claude Code surfaces|</system-reminder>|\Z)",
+    re.S,
+)
+_NOT_HUMAN_ORIGINS = {"task-notification", "peer", "system", "hook"}
+
+
+def _origin_kind(origin):
+    if isinstance(origin, dict):
+        return origin.get("kind")
+    return None
+
+
+def _blocks_text(content):
+    """(texts of text blocks, whether any block is a tool result)."""
     if isinstance(content, str):
-        parts = [content]
-    elif isinstance(content, list):
-        parts = []
+        return [content], False
+    texts, has_result = [], False
+    if isinstance(content, list):
         for block in content:
             if not isinstance(block, dict):
                 continue
             if block.get("type") == "tool_result":
-                return None
-            if block.get("type") == "text":
-                parts.append(block.get("text", ""))
-    else:
-        return None
-    text = clean_text("\n".join(parts))
+                has_result = True
+            elif block.get("type") == "text":
+                texts.append(block.get("text", ""))
+    return texts, has_result
+
+
+def _usable(text):
+    text = clean_text(text)
     if not text or text.lower().startswith(_SKIP_PREFIXES):
         return None
     return text
 
 
+def human_texts(entry):
+    """Texts a human wrote in this record: typed turns, messages sent mid-turn, queued prompts.
+
+    Tool results, hook text, system reminders, compaction summaries and subagent
+    turns are never returned.
+    """
+    if not isinstance(entry, dict) or entry.get("isSidechain") or entry.get("isCompactSummary"):
+        return []
+    kind = entry.get("type")
+    if kind == "attachment":
+        att = entry.get("attachment")
+        if not isinstance(att, dict) or att.get("type") != "queued_command":
+            return []
+        if att.get("commandMode") not in (None, "prompt") or _origin_kind(att.get("origin")) in _NOT_HUMAN_ORIGINS:
+            return []
+        prompt = att.get("prompt")
+        return [t for t in [_usable(prompt)] if t] if isinstance(prompt, str) else []
+    if kind != "user":
+        return []
+    msg = entry.get("message")
+    if not isinstance(msg, dict) or msg.get("role") != "user":
+        return []
+    texts, has_result = _blocks_text(msg.get("content"))
+    out = []
+    # A message typed while the agent was busy is delivered inside another record.
+    for raw in texts:
+        for m in _EMBEDDED_RE.finditer(raw):
+            t = _usable(m.group(1))
+            if t:
+                out.append(t)
+    if (entry.get("isMeta") or entry.get("isVisibleInTranscriptOnly") or has_result
+            or entry.get("toolUseResult") is not None or _origin_kind(entry.get("origin")) in _NOT_HUMAN_ORIGINS):
+        return out
+    for raw in texts:
+        t = _usable(raw)
+        if t:
+            out.append(t)
+    return out
+
+
+def human_text(entry):
+    """The first human text of a record, or None."""
+    found = human_texts(entry)
+    return found[0] if found else None
+
+
 def looks_like_ask(sentence):
-    words = re.findall(r"[A-Za-z']+", sentence)
+    words = re.findall(r"[A-Za-z][A-Za-z'-]*", sentence)
+    if not words:
+        return False
+    if len(words) > 1 and words[0].lower().endswith("ly") and words[0].lower() not in _VERBS:
+        words = words[1:]  # "autonomously fix X" is still an imperative
+    first = words[0].lower()
+    if first in {"do", "go", "get", "let", "note"} and len(words) > 1 and words[1].lower() in _PRONOUNS:
+        return False  # "do you know", "let it", questions and statements, not orders
+    if first in _VERBS and first not in {"please", "need", "want", "should", "must"}:
+        return True  # an imperative can be a single word, e.g. "push"
     if len(words) < 3:
         return False
-    first = words[0].lower()
     if first in _VERBS:
         return True
     if _ASK_RE.search(sentence):
         return True
-    return sentence.rstrip().endswith("?") and first in {"can", "could", "would", "will", "why", "how", "what", "is", "are", "does", "do"}
+    if first in {"why", "how", "what", "which", "where", "when", "who"}:
+        return True
+    return sentence.rstrip().endswith("?") and first in {"can", "could", "would", "will", "is", "are", "does", "do"}
 
 
 def split_asks(text):
     """Split one message into individual asks using imperative-sentence heuristics."""
     out = []
+    text = re.sub(r":[ \t]*\n+[ \t]*", ": ", text)  # "integrate:" then its target on the next line
     for piece in _SPLIT_RE.split(text):
         piece = _BULLET_RE.sub("", piece or "").strip()
         if piece and looks_like_ask(piece):
@@ -147,9 +218,17 @@ def iter_files(paths):
             yield p
 
 
+def _secs(ts):
+    try:
+        return datetime.fromisoformat(ts.replace("Z", "+00:00")).timestamp()
+    except ValueError:
+        return 0.0
+
+
 def collect(paths, since=None):
     """Return (timestamp, ask text) for every ask in the transcripts."""
     items = []
+    seen = {}
     for f in iter_files(paths):
         with open(f, encoding="utf-8", errors="replace") as fh:
             for line in fh:
@@ -159,14 +238,17 @@ def collect(paths, since=None):
                     continue
                 if not isinstance(entry, dict):
                     continue
-                text = human_text(entry)
-                if text is None:
-                    continue
                 ts = str(entry.get("timestamp") or "")
                 if since and ts[: len(since)] < since:
                     continue
-                for ask in split_asks(text):
-                    items.append((ts, ask))
+                for text in human_texts(entry):
+                    # The same message can surface as a queued prompt and again inside a later record.
+                    key = " ".join(text.split())
+                    if key in seen and abs(_secs(ts) - seen[key]) < 300:
+                        continue
+                    seen[key] = _secs(ts)
+                    for ask in split_asks(text):
+                        items.append((ts, ask))
     return items
 
 
