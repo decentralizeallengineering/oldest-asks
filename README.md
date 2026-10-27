@@ -1,5 +1,7 @@
 # oldest-asks
 
+[![tests](https://github.com/decentralizeallengineering/oldest-asks/actions/workflows/tests.yml/badge.svg)](https://github.com/decentralizeallengineering/oldest-asks/actions/workflows/tests.yml) ![license](https://img.shields.io/badge/license-Apache--2.0-blue)
+
 Finds what a person asked their agents for that was never delivered, oldest first. It reads Claude Code session
 transcripts, pulls out the individual asks, and has a small fleet of read-only Haiku workers check each ask against a
 repository. A repeated ask is a strong sign it was never delivered. oldest-asks only calls the `claude` command line
