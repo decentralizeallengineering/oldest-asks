@@ -1,0 +1,121 @@
+#!/usr/bin/env bash
+# hist: before building something, search whether an old version already did it.
+# Environment: HIST_TRANSCRIPT_DIRS (colon-separated dirs searched in section 4; default ~/.claude/projects).
+# Read-only: only git log / git grep / rg are run against repos. Never modifies a repo.
+#
+# usage: hist <pattern> [--repo PATH]... [--rev REV] [--max N]
+#   --repo PATH  search only the given repo(s) (repeatable); default: the git repo of the current directory
+#                plus every path listed in $HIST_REPOS_FILE (default ~/.config/hist/repos.txt, one per line, # comments)
+#   --rev REV    revision for section 3 (current files), default HEAD of each repo
+#   --max N      cap each section (per repo for sections 1-3) at N lines, default 20
+set -u
+export GIT_OPTIONAL_LOCKS=0
+
+GIT_TIMEOUT=60
+REPOS_FILE="${HIST_REPOS_FILE:-$HOME/.config/hist/repos.txt}"
+IFS=: read -r -a RG_DIRS <<< "${HIST_TRANSCRIPT_DIRS:-$HOME/.claude/projects}"
+
+usage() {
+  echo "usage: hist <pattern> [--repo PATH]... [--rev REV] [--max N]" >&2
+  exit 2
+}
+
+[ $# -ge 1 ] || usage
+case $1 in -h|--help) usage ;; esac
+pat=$1; shift
+repos=(); explicit=0; rev=HEAD; max=20
+while [ $# -gt 0 ]; do
+  case $1 in
+    --repo) [ $# -ge 2 ] || usage; repos+=("$2"); explicit=1; shift 2 ;;
+    --rev)  [ $# -ge 2 ] || usage; rev=$2; shift 2 ;;
+    --max)  [ $# -ge 2 ] || usage; max=$2; shift 2 ;;
+    -h|--help) usage ;;
+    *) echo "hist: unknown argument: $1" >&2; usage ;;
+  esac
+done
+case $max in ''|*[!0-9]*) echo "hist: --max must be a number" >&2; exit 2 ;; esac
+
+if [ "$explicit" -eq 0 ]; then
+  top=$(git rev-parse --show-toplevel 2>/dev/null) && repos+=("$top")
+  if [ -f "$REPOS_FILE" ]; then
+    while IFS= read -r line; do
+      line=$(printf '%s' "${line%%#*}" | sed 's/^[[:space:]]*//;s/[[:space:]]*$//')
+      [ -n "$line" ] && [ -d "$line" ] && repos+=("$line")
+    done < "$REPOS_FILE"
+  fi
+  # de-duplicate (the list file may repeat the current repo)
+  declare -A seen=()
+  uniq=()
+  for r in ${repos[@]+"${repos[@]}"}; do
+    r=$(readlink -f "$r")
+    if [ -z "${seen[$r]:-}" ]; then seen[$r]=1; uniq+=("$r"); fi
+  done
+  repos=(${uniq[@]+"${uniq[@]}"})
+fi
+
+# capture CMD... : runs under timeout, sets OUT (stdout) and RC (exit code, 124 = timeout)
+capture() { OUT=$(timeout "$GIT_TIMEOUT" "$@" 2>/dev/null); RC=$?; }
+
+# report NAME : prints OUT (capped) with the name prefix, or timeout / no matches / error
+report() {
+  local name=$1
+  if [ "$RC" -eq 124 ]; then
+    echo "[$name] timeout (>${GIT_TIMEOUT}s)"
+  elif [ "$RC" -gt 1 ]; then
+    echo "[$name] error (exit $RC)"
+  elif [ -z "$OUT" ]; then
+    echo "[$name] (no matches)"
+  else
+    printf '%s\n' "$OUT" | head -n "$max" | sed "s/^/[$name] /"
+  fi
+}
+
+if [ ${#repos[@]} -eq 0 ]; then
+  echo "hist: no repos to search" >&2
+  exit 1
+fi
+
+echo "hist: pattern='$pat' rev=$rev max=$max repos=${#repos[@]}"
+
+echo; echo "== 1. commit messages (git log --all -i --grep) =="
+for r in "${repos[@]}"; do
+  n=$(basename "$r")
+  capture git -C "$r" log --all -i --grep="$pat" --format='%h %ad %s' --date=short
+  report "$n"
+done
+
+echo; echo "== 2. code changes (git log --all -G) =="
+for r in "${repos[@]}"; do
+  n=$(basename "$r")
+  capture git -C "$r" log --all -G"$pat" --format='%h %ad %s' --date=short
+  report "$n"
+done
+
+echo; echo "== 3. current files on rev $rev (git grep) =="
+for r in "${repos[@]}"; do
+  n=$(basename "$r")
+  capture git -C "$r" grep -n -I -i -e "$pat" "$rev" --
+  report "$n"
+done
+
+echo; echo "== 4. transcripts (rg, one line per file) =="
+rg_dirs=()
+for d in "${RG_DIRS[@]}"; do
+  [ -d "$d" ] && rg_dirs+=("$d")
+done
+if [ ${#rg_dirs[@]} -eq 0 ]; then
+  echo "[transcripts] (no dirs present)"
+else
+  capture rg -i --max-count 1 -n --no-heading --with-filename \
+    --glob '!*key*' --glob '!*token*' --glob '!*secret*' --glob '!*.pem' \
+    -e "$pat" -- "${rg_dirs[@]}"
+  if [ "$RC" -eq 124 ]; then
+    echo "[transcripts] timeout (>${GIT_TIMEOUT}s)"
+  elif [ "$RC" -gt 1 ]; then
+    echo "[transcripts] error (exit $RC)"
+  elif [ -z "$OUT" ]; then
+    echo "[transcripts] (no matches)"
+  else
+    printf '%s\n' "$OUT" | head -n "$max" | cut -c1-200 | sed "s/^/[transcripts] /"
+  fi
+fi

@@ -45,6 +45,17 @@ UNMET and the repeat counts.
 Options for `check`: `--model` (default `haiku`), `--timeout` seconds per worker (default 600), `--verdicts`,
 `--prompt`, `--show-prompt` with `--dry-run`.
 
+## hist: check history before building
+
+`hist/hist PATTERN` answers "did an earlier version already do this?" before you build it again. It is read-only (git log, git grep, rg) and prints four sections, each capped by `--max` (default 20): commit messages (`git log --all --grep`), code changes (`git log --all -G`), current files at `--rev`, and one hit per file in your session transcripts.
+
+    $ hist/hist "rate limiter" --repo ~/code/my-project --max 5
+    hist: pattern='rate limiter' rev=HEAD max=5 repos=1
+    == 1. commit messages (git log --all -i --grep) ==
+    [my-project] 3f2a1bc 2026-03-02 add rate limiter
+
+Repos: `--repo PATH` (repeatable), else the git repo of the current directory plus the paths in `$HIST_REPOS_FILE` (default `~/.config/hist/repos.txt`). Transcript dirs: `$HIST_TRANSCRIPT_DIRS`, colon-separated, default `~/.claude/projects`. File names containing key, token, secret or .pem are skipped.
+
 ## The same fan-out as a Claude Code subagent recipe
 
 Instead of the `check` command, a parent Claude Code session can do the fan-out itself. After `extract`, ask the
